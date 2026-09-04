@@ -76,6 +76,24 @@ from teleop.ui import (  # noqa: E402
 )
 
 
+def resync(arm, names, pos, target, blocked_dir) -> bool:
+    """Take up the arm's present pose as the panel's own.
+
+    Parking and calibration move the arm without going through `target`, so on the way
+    back those targets describe where the arm used to be. Sending them would drag it
+    there. False means the arm did not answer and nothing was changed.
+    """
+    obs = arm.observation()
+    if not obs:
+        return False
+    for n in names:
+        if f"{n}.pos" in obs:
+            pos[n] = float(obs[f"{n}.pos"])
+            target[n] = pos[n]
+        blocked_dir[n] = 0
+    return True
+
+
 def sample_loads(arm, names, loads, errors, last_ok) -> None:
     """Refresh each joint's load, keeping the last good value on a failed read.
 
@@ -175,11 +193,16 @@ def main() -> None:
                         if ev.key == pygame.K_ESCAPE:
                             if park and not park.done:
                                 park.abort()
+                                resync(arm, names, pos, target, blocked_dir)
                             else:
-                                # Back to the panel, but the finished run is kept: it is
-                                # clearing it that let the next Q drive the whole
-                                # sequence a second time.
+                                # Back to the panel, keeping the finished run: clearing
+                                # it is what let the next Q re-drive the sequence.
+                                # Parking moved the arm behind the panel's back, so its
+                                # targets are stale — sending them would yank the arm
+                                # back to where it stood before parking.
+                                resync(arm, names, pos, target, blocked_dir)
                                 park_screen, quitting = False, False
+                                status = "back from parking — the arm stays put"
                         elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                             if park is None and load_pose() and not unreachable(load_pose()):
                                 park = Park(arm, load_pose(), dt)
