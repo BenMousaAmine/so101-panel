@@ -472,7 +472,7 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
     ui.text("Parking", ui.f_title, TEXT, PAD, 20)
     ui.text("one joint at a time, wrist to base", ui.f_sub, FAINT, PAD + 108, 27)
 
-    card = pygame.Rect(PAD, 104, W - PAD * 2, 340 if park and park.done else 300)
+    card = pygame.Rect(PAD, 104, W - PAD * 2, 340 if park and park.done else 320)
     pygame.draw.rect(s, PANEL, card, border_radius=12)
     pygame.draw.rect(s, STROKE, card, 1, border_radius=12)
     x, y = PAD + 30, 132
@@ -512,10 +512,13 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
             ui.text("It stops on its own if any joint strains or falls short.",
                     ui.f_small, DIM, x, y + 52)
             bx = ui.keycap("ENTER", x, y + 84, active=True)
-            ui.text("park" + (", then quit" if asked_to_quit else ""),
-                    ui.f_small, TEXT, bx + 4, y + 87)
-            bx = ui.keycap("S", x + 250, y + 84)
-            ui.text("re-save this pose", ui.f_small, FAINT, bx + 4, y + 87)
+            ui.text("one joint at a time — wrist to base", ui.f_small, TEXT,
+                    bx + 4, y + 87)
+            bx = ui.keycap("T", x, y + 112)
+            ui.text("all together, timed so they arrive at once", ui.f_small, TEXT,
+                    bx + 4, y + 115)
+            bx = ui.keycap("S", x, y + 144)
+            ui.text("re-save this pose", ui.f_small, FAINT, bx + 4, y + 147)
             if asked_to_quit:
                 bx = ui.keycap("Q", x + 480, y + 84)
                 ui.text("quit now — torque off, the arm drops", ui.f_small, BAD,
@@ -564,7 +567,21 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
         ui.text("back to the panel — the arm stays parked", ui.f_small, FAINT,
                 bx + 4, fy + 107)
     else:
-        ui.text(f"moving {park.joint}", ui.f_head, ACCENT, x, fy)
-        bx = ui.keycap("ESC", x, fy + 34, active=True)
-        ui.text("stop here — the arm stays held", ui.f_small, WARN, bx + 4, fy + 37)
+        together = hasattr(park, "progress")
+        if together:
+            ui.text(f"moving all six — {park.progress * 100:.0f}%", ui.f_head, ACCENT, x, fy)
+            bw = W - PAD * 2 - 60
+            pygame.draw.rect(s, TRACK, pygame.Rect(x, fy + 28, bw, 8), border_radius=4)
+            pygame.draw.rect(s, ACCENT,
+                             pygame.Rect(x, fy + 28, max(3, int(bw * park.progress)), 8),
+                             border_radius=4)
+            lead = park.joint
+            ui.text(f"{lead} has furthest to go" if lead else "", ui.f_small, FAINT,
+                    x, fy + 44)
+            by = fy + 70
+        else:
+            ui.text(f"moving {park.joint}", ui.f_head, ACCENT, x, fy)
+            by = fy + 34
+        bx = ui.keycap("ESC", x, by, active=True)
+        ui.text("stop everything — the arm stays held", ui.f_small, WARN, bx + 4, by + 3)
     pygame.display.flip()

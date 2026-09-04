@@ -39,7 +39,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from teleop.arm import Arm  # noqa: E402
 from teleop.calibration_wizard import CENTRE, DONE  # noqa: E402
 from teleop.calibration_wizard import TRAVEL as STEP_TRAVEL  # noqa: E402
-from teleop.park import ARRIVED, Park, capture, load_pose, save_pose, unreachable  # noqa: E402
+from teleop.park import (ARRIVED, Park, ParkTogether, capture, load_pose,  # noqa: E402
+                         save_pose, unreachable)
 from teleop.limits import (  # noqa: E402
     FPS,
     LOAD_EVERY,
@@ -223,6 +224,10 @@ def main() -> None:
                             park.released = True
                             if quitting:
                                 running = False
+                        elif (ev.key == pygame.K_t and park is None and load_pose()
+                              and not unreachable(load_pose())):
+                            park = ParkTogether(arm, load_pose(), dt)
+                            moved_since_park = False
                         elif ev.key == pygame.K_s and arm.live:
                             save_pose(capture(arm))
                             status = "safe pose saved"
