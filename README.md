@@ -78,6 +78,12 @@ Each span is judged before it is kept:
 Nothing is written until all six joints pass and you confirm. Press **ESC** at any point
 and the existing calibration is untouched.
 
+### If the arm was moved while unplugged
+
+The panel catches this on connection and offers to fix it. From inside the panel, **V**
+runs the same check on demand: it compares each motor's homing offset against the file
+and, if they disagree, drops torque and writes the file back to the motors.
+
 ### Controls
 
 | Key | Action |
@@ -90,6 +96,7 @@ and the existing calibration is untouched.
 | `F` | Free every joint — **support the arm first** |
 | `R` | Re-arm after a stop |
 | `C` | Guided calibration |
+| `V` | Verify the motors against the calibration file, and restore it if they drifted |
 | `SPACE` (hold 1s) | Release all torque — **the arm will drop** |
 | `Q` / `ESC` | Quit |
 
@@ -101,11 +108,24 @@ The panel refuses to keep straining a stuck joint. Past a load threshold it bloc
 direction that is straining and tells you to drive the other way — resetting the target
 instead makes the motor fight itself at 30 Hz.
 
+## If a joint will not move
+
+A joint can start up beyond its calibrated travel, if the arm sagged past a limit while
+it was unpowered. It shows as `outside travel`; drive it back inside — the limit never
+blocks the direction that returns it.
+
+A joint that reads a very high load is straining against something: an obstacle, its own
+mechanical stop, or a pose the arm cannot hold. The panel blocks the direction that is
+straining and asks you to drive the other way, or free that joint with `T`.
+
 ## Safety
 
 The arm has no brakes. With torque off it falls under its own weight.
 
 - `F`, `SPACE` and the calibration all cut torque. Support the arm before using them.
+- After a restore or a calibration the arm is left limp on purpose. The panel waits for
+  you to take its weight before arming, because powering up locks it exactly where it
+  is — if it has sagged, that is the pose it will hold.
 - Quitting releases torque. The arm drops if nothing is holding it.
 - Restoring a calibration changes the position each motor believes it is at, so it is
   always done with torque off.

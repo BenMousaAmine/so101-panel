@@ -75,14 +75,16 @@ class Wizard:
                 pass
 
     def poll(self) -> None:
-        """Track the joint's travel while the operator moves it."""
-        if self.step != TRAVEL:
+        """Follow the joint: live position while centring, travel while recording."""
+        if self.step == DONE:
             return
         try:
             raw = self.bus.read("Present_Position", self.joint, normalize=False, num_retry=2)
         except Exception:
             return
         self.now = raw
+        if self.step == CENTRE:
+            return
         self.lo = raw if self.lo is None else min(self.lo, raw)
         self.hi = raw if self.hi is None else max(self.hi, raw)
         self.ok, self.note = judge(self.joint, self.span)

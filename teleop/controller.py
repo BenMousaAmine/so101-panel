@@ -13,12 +13,15 @@ always see where it is and how much room is left.
     H              hold every joint where it is
     F              free every joint (support the arm first)
     R              re-arm everything after a stop
+    C              guided calibration, one joint at a time
+    V              verify the motors against the calibration file, and restore it
     SPACE (hold 1s) release all torque — the arm will drop, so support it first
     Q / ESC        quit
 
 On startup the motors are checked against the calibration file: moving the arm by hand
 while unpowered leaves them homed somewhere else, and arming on top of that makes the
-arm snap. A mismatch is offered a fix before anything is powered.
+arm snap. A mismatch is offered a fix before anything is powered, and V runs the same
+check again at any time.
 
 Every frame is logged to data/logs/.
 """
@@ -45,8 +48,20 @@ from teleop.restore_calibration import mismatched_joints, restore  # noqa: E402
 
 FPS = 30
 SPEEDS = [2.0, 5.0, 10.0, 20.0, 35.0, 55.0]
-LOAD_WARN = 200
-LOAD_STOP = 350
+# At P=36 a normal lift peaks around 850, so the old 200/350 thresholds fired on healthy
+# movement. These sit above working load and below the 1000 ceiling that trips the
+# motor's own overload protection.
+LOAD_WARN = 700
+LOAD_STOP = 950
+# lerobot's configure() writes P_Coefficient=16, half the STS3215 factory default of 32
+# (huggingface/lerobot#3400). At 16 the loop stops pushing well before the available
+# torque is used: shoulder_lift climbed 2.9 deg at P=16 and 36.7 deg at P=36, measured
+# on this arm. The step is sharp between 34 and 36; 38 gains nothing and costs load.
+POSITION_P = 36
+# How far the commanded position may run ahead of where the joint actually is. Without
+# this the target keeps advancing every frame while the joint stalls, so the error winds
+# up without limit and the motor is left straining at a goal tens of degrees away.
+MAX_LAG = 8.0
 LOAD_EVERY = 3
 TEMP_EVERY = 30      # temperature and voltage move slowly; once a second is plenty
 STALE_AFTER = 2.0    # seconds without a good read before a joint is shown as unresponsive
@@ -176,7 +191,11 @@ class UI:
         self.text(label, font, BG, x + 7, y + 3)
         return x + w + 6
 
-    def joint_row(self, i, name, pos, cmd, load, temp, volt, torque, selected, stale, y):
+    def joint_row(self, i, name, pos, cmd, load, temp, volt, torque, selected, stale, y,
+                  blocked=0):
+        # Telemetry can be missing for a joint that has not answered yet; drawing must
+        # never be the thing that takes the panel down.
+        load, temp, volt = load or 0, temp or 0, volt or 0.0
         lo, hi = SCALE[name]
         clo, chi = TRAVEL[name]
         unit = "%" if name == "gripper" else "\u00b0"
@@ -193,9 +212,12 @@ class UI:
         self.text(name, self.f_name, TEXT if torque else DIM, PAD + 40, y + 12)
         self.text(DESC[name], self.f_small, FAINT, PAD + 40, y + 32)
 
-        self.pill("HOLD" if torque else "FREE", GOOD if torque else WARN, PAD + 40, y + 52)
-        if stale:
-            self.text("not responding", self.f_small, BAD, PAD + 96, y + 55)
+        px2 = self.pill("HOLD" if torque else "FREE", GOOD if torque else WARN,
+                        PAD + 40, y + 52)
+        if blocked:
+            self.pill(f"BLOCKED {'>' if blocked > 0 else '<'}", BAD, px2, y + 52)
+        elif stale:
+            self.text("not responding", self.f_small, BAD, px2, y + 55)
 
         bx, by, bw, bh = 330, y + 26, 380, 10
         pygame.draw.rect(self.screen, TRACK, pygame.Rect(bx, by, bw, bh), border_radius=5)
@@ -277,6 +299,7 @@ class Arm:
     NO_PORT = "no_port"
     CONNECTING = "connecting"
     MISMATCH = "mismatch"
+    LIMP = "limp"
     UNCALIBRATED = "uncalibrated"
     CALIBRATING = "calibrating"
     READY = "ready"
@@ -302,7 +325,8 @@ class Arm:
 
     def poll(self) -> None:
         """Look for the arm and connect. Cheap enough to call every frame."""
-        if self.state in (self.READY, self.MISMATCH, self.UNCALIBRATED, self.CALIBRATING):
+        if self.state in (self.READY, self.MISMATCH, self.LIMP, self.UNCALIBRATED,
+                          self.CALIBRATING):
             return
         now = time.time()
         if now - self._last_try < self.RETRY_EVERY:
@@ -338,6 +362,13 @@ class Arm:
         self.names = list(robot.bus.motors)
         save_port(port)
 
+        for m in self.names:
+            try:
+                if robot.bus.read("P_Coefficient", m, normalize=False, num_retry=2) != POSITION_P:
+                    robot.bus.write("P_Coefficient", m, POSITION_P, num_retry=3)
+            except Exception:
+                pass
+
         if not load_calibration():
             self.state = self.UNCALIBRATED
             self.detail = "no calibration file for this arm yet"
@@ -372,9 +403,28 @@ class Arm:
             self.detail = f"did not take: {', '.join(bad)}"
             return False
         self.wrong = []
-        self.state = self.READY
-        self.detail = "calibration restored"
+        # Torque is off and the arm has sagged wherever gravity left it. Arming now
+        # would read one pose, energise into another, and yank the arm there. The
+        # operator has to take its weight first.
+        self.state = self.LIMP
+        self.detail = "calibration restored — the arm is limp"
         return True
+
+    def recheck(self) -> list[tuple[str, int, int]]:
+        """Compare the motors against the file again, while the panel is running.
+
+        The offsets only drift when the arm is unplugged and moved, which cannot happen
+        mid-session — but a bus glitch or a second process writing to the motors can,
+        and checking costs one read per joint.
+        """
+        if self.robot is None:
+            return []
+        try:
+            self.wrong = mismatched_joints(self.robot.bus)
+        except Exception as e:
+            self.detail = str(e)[:70]
+            return []
+        return self.wrong
 
     def start_calibration(self) -> None:
         """Hand the arm to the guided calibration; nothing is powered until it finishes."""
@@ -404,6 +454,10 @@ class Arm:
         self.connect(port)
         if self.state == self.MISMATCH:
             self.restore_calibration()
+        elif self.state == self.READY:
+            # Every joint was left free for the calibration, so the arm is hanging.
+            self.state = self.LIMP
+            self.detail = "calibration saved — the arm is limp"
 
     def drop(self, why: str) -> None:
         """Give up the connection and go back to looking for one."""
@@ -492,10 +546,37 @@ def draw_wizard(ui, arm) -> None:
     if w.step == CENTRE:
         ui.text("Step 1  —  put this joint in the MIDDLE of its travel by hand",
                 ui.f_small, TEXT, x, y + 40)
-        ui.text("Every joint is limp. The middle does not need to be exact.",
+        ui.text("Every joint is limp. Aim for the marker near the centre line.",
                 ui.f_small, DIM, x, y + 62)
-        bx = ui.keycap("ENTER", x, y + 100, active=True)
-        ui.text("this is the middle", ui.f_small, TEXT, bx + 4, y + 103)
+
+        # The encoder's own midpoint. It is not the joint's true mechanical centre —
+        # that is what this step is about to define — but it is the reference the
+        # operator can actually see, and starting far from it wastes half the travel.
+        bx, by, bw, bh = x, y + 104, W - PAD * 2 - 60, 14
+        pygame.draw.rect(s, TRACK, pygame.Rect(bx, by, bw, bh), border_radius=7)
+        mid = bx + bw // 2
+        pygame.draw.rect(s, PANEL_SEL,
+                         pygame.Rect(mid - int(bw * 0.08), by, int(bw * 0.16), bh),
+                         border_radius=7)
+        pygame.draw.line(s, ACCENT, (mid, by - 6), (mid, by + bh + 6), 2)
+
+        frac = max(0.0, min(1.0, w.now / ENCODER))
+        nx = bx + int(bw * frac)
+        off = w.now - ENCODER // 2
+        near = abs(off) < ENCODER * 0.08
+        pygame.draw.circle(s, GOOD if near else WARN, (nx, by + bh // 2), 7)
+        pygame.draw.circle(s, BG, (nx, by + bh // 2), 7, 1)
+
+        ui.text("0", ui.f_small, FAINT, bx, by + 22)
+        ui.text("centre", ui.f_small, ACCENT, mid, by + 22, centre=True)
+        ui.text(str(ENCODER), ui.f_small, FAINT, bx + bw, by + 22, right=True)
+        ui.text(f"raw {w.now}", ui.f_val, TEXT, x, by + 46)
+        ui.text("good — press ENTER" if near else
+                f"{abs(off)} counts {'above' if off > 0 else 'below'} centre",
+                ui.f_small, GOOD if near else WARN, x + 110, by + 49)
+
+        bx2 = ui.keycap("ENTER", x, 320, active=True)
+        ui.text("this is the middle", ui.f_small, TEXT, bx2 + 4, 323)
     else:
         ui.text("Step 2  —  move it through its FULL travel, both directions",
                 ui.f_small, TEXT, x, y + 40)
@@ -545,10 +626,16 @@ def draw_disconnected(ui, arm) -> None:
         Arm.CONNECTING: (ACCENT, "CONNECTING"),
         Arm.MISMATCH: (BAD, "CALIBRATION MISMATCH"),
         Arm.UNCALIBRATED: (ACCENT, "NOT CALIBRATED YET"),
+        Arm.LIMP: (WARN, "ARM IS LIMP"),
         Arm.FAILED: (BAD, "CONNECTION FAILED"),
     }.get(arm.state, (DIM, arm.state.upper()))
 
-    body = 244 + len(arm.wrong) * 19 if arm.state == Arm.MISMATCH else 178
+    if arm.state == Arm.MISMATCH:
+        body = 244 + len(arm.wrong) * 19
+    elif arm.state == Arm.LIMP:
+        body = 232
+    else:
+        body = 178
     card = pygame.Rect(PAD, 110, W - PAD * 2, body)
     pygame.draw.rect(s, PANEL, card, border_radius=12)
     pygame.draw.rect(s, STROKE, card, 1, border_radius=12)
@@ -574,6 +661,15 @@ def draw_disconnected(ui, arm) -> None:
         ui.text("Support the arm — torque stays off during the fix.", ui.f_small, WARN, x, y)
         ui.keycap("Y", x, y + 22, active=True)
         ui.text("restore the calibration from file", ui.f_small, TEXT, x + 32, y + 25)
+    elif arm.state == Arm.LIMP:
+        ui.text("The motors now agree with the calibration file. Torque is off, so the",
+                ui.f_small, DIM, x, y)
+        ui.text("arm is hanging under its own weight.", ui.f_small, DIM, x, y + 18)
+        ui.text("Take its weight and hold it in a safe pose before arming: powering up",
+                ui.f_small, WARN, x, y + 44)
+        ui.text("locks it exactly where it is.", ui.f_small, WARN, x, y + 62)
+        bx = ui.keycap("ENTER", x, y + 92, active=True)
+        ui.text("I am holding the arm — hold this pose", ui.f_small, TEXT, bx + 4, y + 95)
     elif arm.state == Arm.UNCALIBRATED:
         ui.text("This arm has no calibration on this machine yet. Until it does, the",
                 ui.f_small, DIM, x, y)
@@ -684,10 +780,21 @@ def main() -> None:
                         arm.start_calibration()
                     elif arm.state == Arm.MISMATCH and ev.key == pygame.K_y:
                         status = "restoring calibration — torque off"
-                        if arm.restore_calibration():
-                            arm_it()
-                        else:
+                        if not arm.restore_calibration():
                             status = arm.detail
+                    elif arm.state == Arm.LIMP and ev.key in (pygame.K_RETURN,
+                                                              pygame.K_KP_ENTER):
+                        arm.state = Arm.READY
+                        arm_it()
+                    elif arm.live and ev.key == pygame.K_v:
+                        wrong = arm.recheck()
+                        if not wrong:
+                            status = "motors match the calibration file"
+                        else:
+                            for n in names:
+                                arm.torque(n, False)
+                            if not arm.restore_calibration():
+                                status = arm.detail
                     elif not arm.live:
                         pass          # nothing else means anything without an arm
                     elif pygame.K_1 <= ev.key <= pygame.K_6:
@@ -703,6 +810,7 @@ def main() -> None:
                         arm.torque(m, torque[m])
                         if torque[m]:
                             target[m] = float(arm.observation().get(f"{m}.pos", target[m]))
+                            blocked_dir[m] = 0
                         status = f"{m} torque {'on' if torque[m] else 'off'}"
                     elif ev.key == pygame.K_f:
                         for n in names:
@@ -715,6 +823,7 @@ def main() -> None:
                             target[n] = float(now_obs.get(f"{n}.pos", target[n]))
                             arm.torque(n, True)
                             torque[n] = True
+                            blocked_dir[n] = 0
                         stopped = False
                         status = "all joints holding"
                     elif ev.key == pygame.K_r:
@@ -723,6 +832,7 @@ def main() -> None:
                             target[n] = float(now.get(f"{n}.pos", target[n]))
                             arm.torque(n, True)
                             torque[n] = True
+                            blocked_dir[n] = 0
                         stopped = False
                         status = "re-armed"
                     elif ev.key == pygame.K_SPACE:
@@ -765,17 +875,41 @@ def main() -> None:
 
             m = names[sel]
             if moving:
-                if blocked_dir[m] == moving:
+                # A joint sitting outside its travel is straining against its own stop,
+                # so its load stays high and the block would re-arm every tick. The way
+                # back inside is the fix for that strain, never something to refuse.
+                mlo, mhi = TRAVEL[m]
+                escaping = (pos[m] < mlo and moving > 0) or (pos[m] > mhi and moving < 0)
+                if escaping:
+                    blocked_dir[m] = 0
+                elif blocked_dir[m] == moving:
                     status = f"{m} is stuck this way — drive it the other way"
                     moving = 0
                 elif blocked_dir[m]:
                     blocked_dir[m] = 0      # driving the opposite way clears the block
             if moving and torque[m]:
                 lo, hi = TRAVEL[m]
-                nxt = max(lo, min(hi, target[m] + moving * SPEEDS[speed_i] * dt))
+                step = moving * SPEEDS[speed_i] * dt
+                nxt = target[m] + step
+                # A joint that starts outside its travel — the arm sagged past a limit
+                # while unpowered — must still be drivable back inside. Clamping it to
+                # the limit it is already beyond would pin it there under load.
+                if nxt < lo:
+                    nxt = target[m] if target[m] < lo and step < 0 else lo
+                elif nxt > hi:
+                    nxt = target[m] if target[m] > hi and step > 0 else hi
                 if nxt == target[m]:
                     status = f"{m} at limit ({lo:.0f} .. {hi:.0f})"
                     moving = 0
+                # Never command further than MAX_LAG beyond the joint's real position:
+                # a joint that cannot keep up must not accumulate an ever-growing error.
+                lag_lo, lag_hi = pos[m] - MAX_LAG, pos[m] + MAX_LAG
+                if nxt > lag_hi:
+                    nxt = max(target[m], lag_hi) if target[m] > lag_hi else lag_hi
+                    status = f"{m} is not keeping up — it may not have the torque here"
+                elif nxt < lag_lo:
+                    nxt = min(target[m], lag_lo) if target[m] < lag_lo else lag_lo
+                    status = f"{m} is not keeping up — it may not have the torque here"
                 target[m] = nxt
 
             held = {f"{n}.pos": target[n] for n in names if torque[n]}
@@ -784,33 +918,63 @@ def main() -> None:
 
             if tick % LOAD_EVERY == 0:
                 for n in names:
-                    try:
-                        loads[n] = abs(arm.read("Present_Load", n))
-                        last_ok[n] = time.time()
-                    except Exception:
-                        # A joint that slammed into a stop goes quiet for a moment; one
-                        # bad motor must never stall the loop, which once froze it.
+                    # A joint that slammed into a stop goes quiet for a moment and reads
+                    # None; keep the last good value rather than stalling the loop or
+                    # poisoning the telemetry with a None the panel would then draw.
+                    raw = arm.read("Present_Load", n)
+                    if raw is None:
                         errors[n] += 1
+                    else:
+                        loads[n] = abs(raw)
+                        last_ok[n] = time.time()
 
             if tick % TEMP_EVERY == 0:
                 n = names[(tick // TEMP_EVERY) % len(names)]
-                try:
-                    temps[n] = arm.read("Present_Temperature", n)
-                    volts[n] = arm.read("Present_Voltage", n) / 10
-                except Exception:
+                t = arm.read("Present_Temperature", n)
+                v = arm.read("Present_Voltage", n)
+                if t is None or v is None:
                     errors[n] += 1
+                else:
+                    temps[n] = t
+                    volts[n] = v / 10
 
             if tick % LOAD_EVERY == 0:
+                for n in names:
+                    if blocked_dir[n] and loads[n] <= LOAD_WARN:
+                        # Well below the warning threshold the joint is plainly not
+                        # straining any more, so the block is a leftover flag that would
+                        # refuse a command the motor can now carry out.
+                        blocked_dir[n] = 0
+
                 over = [n for n in names if loads[n] > LOAD_STOP]
                 if over:
                     # Resetting the target to the current position instead oscillated at
                     # 30Hz against a held key: load hit 448 for 0.5 degrees in 15 seconds.
                     for n in over:
-                        blocked_dir[n] = 1 if target[n] > pos[n] else -1
+                        nlo, nhi = TRAVEL[n]
+                        if pos[n] < nlo or pos[n] > nhi:
+                            # Outside travel: the strain is the stop itself. Pinning the
+                            # target to the present position would freeze the joint there
+                            # for good, with no key able to move it.
+                            continue
+                        # Keep the direction that first caused the strain: recomputing
+                        # it once the target has been pinned to pos flips it every tick,
+                        # which made the badge alternate and the message contradict itself.
+                        if not blocked_dir[n]:
+                            blocked_dir[n] = 1 if target[n] > pos[n] else -1
                         target[n] = pos[n]
                     moving = 0
-                    status = (f"{over[0]} load {loads[over[0]]} — stuck. "
-                              "Drive it the other way, or T to free just this joint.")
+                    n0 = over[0]
+                    status = (f"{n0} load {loads[n0]} — stuck. Press "
+                              f"{names.index(n0) + 1} to select it, then drive it the "
+                              "other way, or T to free just that joint.")
+                elif "— stuck." in status:
+                    # The strain is gone; leaving the warning up makes a working joint
+                    # look jammed. The direction block stays until it is driven clear.
+                    still = [n for n in names if blocked_dir[n]]
+                    status = (f"{still[0]} still blocked one way — press "
+                              f"{names.index(still[0]) + 1} and drive it back"
+                              if still else "ready")
                 # Not cleared on load: blocking is what makes load fall, so a low reading
                 # would unblock instantly. Only driving the other way clears it.
 
@@ -834,7 +998,16 @@ def main() -> None:
             ui.text("SO-101 Controller", ui.f_title, TEXT, PAD, 20)
             ui.text("direct joint control", ui.f_sub, FAINT, PAD + 218, 27)
 
-            if not focused:
+            stuck_out = [n for n in names
+                         if not (TRAVEL[n][0] <= pos[n] <= TRAVEL[n][1])]
+            if stuck_out:
+                # A joint past its calibrated limit has no travel left in that direction:
+                # it will not move however hard it is driven, and every further command
+                # pushes it deeper into the mechanical stop. Nothing else matters until
+                # it is back inside.
+                banner, bcol = "JOINT OUTSIDE TRAVEL", BAD
+                sub = f"{', '.join(stuck_out)} — drive back inside, or F and reposition"
+            elif not focused:
                 banner, bcol, sub = "CLICK TO TAKE CONTROL", WARN, "keys only reach the focused window"
             elif stopped:
                 banner, bcol, sub = "STOPPED", BAD, "press R to re-arm"
@@ -851,7 +1024,8 @@ def main() -> None:
             y = 78
             for i, n in enumerate(names):
                 ui.joint_row(i, n, pos[n], target[n], loads[n], temps[n], volts[n],
-                             torque[n], i == sel, now - last_ok[n] > STALE_AFTER, y)
+                             torque[n], i == sel, now - last_ok[n] > STALE_AFTER, y,
+                             blocked_dir.get(n, 0))
                 y += ROW_H + ROW_GAP
 
             py = y + 4
@@ -900,9 +1074,10 @@ def main() -> None:
             x = ui.keycap("R", x, fy, active=stopped)
             x = ui.keycap("SPACE", x, fy)
             x = ui.keycap("C", x, fy)
+            x = ui.keycap("V", x, fy)
             ui.keycap("Q", x, fy)
 
-            ui.text("T torque   H hold all   F free all   R re-arm   SPACE release   C calibrate",
+            ui.text("T torque  H hold  F free  R re-arm  SPACE release  C calibrate  V verify",
                     ui.f_small, FAINT, PAD + 330, fy + 26)
             ui.text(status, ui.f_small, WARN if stopped else DIM, PAD, fy + 44)
             ui.text(f"calibration ok    {arm.port}", ui.f_small, GOOD, W - PAD, fy + 44,
