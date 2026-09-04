@@ -39,6 +39,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from teleop.arm import Arm  # noqa: E402
 from teleop.calibration_wizard import CENTRE, DONE  # noqa: E402
 from teleop.calibration_wizard import TRAVEL as STEP_TRAVEL  # noqa: E402
+from teleop.park import ARRIVED, Park, capture, load_pose, save_pose, unreachable  # noqa: E402
 from teleop.limits import (  # noqa: E402
     FPS,
     LOAD_EVERY,
@@ -47,6 +48,7 @@ from teleop.limits import (  # noqa: E402
     MAX_LAG,
     SPEEDS,
     STALE_AFTER,
+    TEMP_CUT,
     TEMP_EVERY,
     TRAVEL,
 )
@@ -69,6 +71,7 @@ from teleop.ui import (  # noqa: E402
     WARN,
     draw_disconnected,
     draw_panel,
+    draw_park,
     draw_wizard,
 )
 
@@ -145,6 +148,10 @@ def main() -> None:
     sel, speed_i = 0, 0
     status, stopped, moving = "waiting for the arm", False, 0
     space_since = None
+    park = None            # a Park run, or None when the screen is only offering one
+    park_screen = False
+    moved_since_park = False   # a finished run is only worth repeating if the arm moved
+    quitting = False       # the park screen was opened by Q, so finishing it quits
     SPACE_HOLD = 1.0   # seconds SPACE must be held before torque is cut
     dt, tick = 1.0 / FPS, 0
     running = True
@@ -163,7 +170,44 @@ def main() -> None:
                 if ev.type == pygame.QUIT:
                     running = False
                 elif ev.type == pygame.KEYDOWN:
-                    if arm.state == Arm.CALIBRATING:
+                    if park_screen:
+                        finished = park is not None and park.done
+                        if ev.key == pygame.K_ESCAPE:
+                            if park and not park.done:
+                                park.abort()
+                            else:
+                                # Back to the panel, but the finished run is kept: it is
+                                # clearing it that let the next Q drive the whole
+                                # sequence a second time.
+                                park_screen, quitting = False, False
+                        elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                            if park is None and load_pose() and not unreachable(load_pose()):
+                                park = Park(arm, load_pose(), dt)
+                                moved_since_park = False
+                            elif finished:
+                                # A finished run is an ending, not a step back into the
+                                # panel: returning there leaves park cleared, and the
+                                # next Q would drive the whole sequence a second time.
+                                running = False
+                        elif (ev.key == pygame.K_f and park and park.done
+                              and park.outcome == ARRIVED):
+                            # The operator says the arm is resting on something, so the
+                            # motors have nothing to hold and no reason to make heat.
+                            for n in names:
+                                arm.torque(n, False)
+                                torque[n] = False
+                            park.detail = "parked and released — resting, motors cool"
+                            park.released = True
+                            if quitting:
+                                running = False
+                        elif ev.key == pygame.K_s and arm.live:
+                            save_pose(capture(arm))
+                            status = "safe pose saved"
+                        elif ev.key == pygame.K_q and quitting and park is None:
+                            for n in names:
+                                arm.torque(n, False)
+                            running = False
+                    elif arm.state == Arm.CALIBRATING:
                         w = arm.wizard
                         if ev.key == pygame.K_ESCAPE:
                             arm.wizard = None
@@ -181,7 +225,14 @@ def main() -> None:
                         elif ev.key == pygame.K_r and w.step == STEP_TRAVEL:
                             w.redo()
                     elif ev.key in (pygame.K_q, pygame.K_ESCAPE):
-                        running = False
+                        if arm.live and load_pose():
+                            park_screen, quitting = True, True
+                            park = None if moved_since_park else park
+                        else:
+                            running = False
+                    elif arm.live and ev.key == pygame.K_p:
+                        park_screen, quitting = True, False
+                        park = None if moved_since_park else park
                     elif arm.state == Arm.UNCALIBRATED and ev.key == pygame.K_c:
                         arm.start_calibration()
                     elif arm.live and ev.key == pygame.K_c:
@@ -250,6 +301,12 @@ def main() -> None:
 
             keys = pygame.key.get_pressed()
             focused = pygame.key.get_focused()
+            if park_screen:
+                if park and not park.done:
+                    park.step()
+                draw_park(ui, arm, park, load_pose(), quitting)
+                time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
+                continue
             if arm.state == Arm.CALIBRATING:
                 arm.wizard.poll()
                 draw_wizard(ui, arm)
@@ -319,6 +376,9 @@ def main() -> None:
                     status = f"{m} is not keeping up — it may not have the torque here"
                 target[m] = nxt
 
+            if moving:
+                moved_since_park = True
+
             held = {f"{n}.pos": target[n] for n in names if torque[n]}
             if held:
                 arm.send(held)
@@ -326,8 +386,15 @@ def main() -> None:
             if tick % LOAD_EVERY == 0:
                 sample_loads(arm, names, loads, errors, last_ok)
             if tick % TEMP_EVERY == 0:
-                sample_climate(arm, names[(tick // TEMP_EVERY) % len(names)],
-                               temps, volts, errors)
+                hot = names[(tick // TEMP_EVERY) % len(names)]
+                sample_climate(arm, hot, temps, volts, errors)
+                # Free the joint before the motor has to save itself by leaving the bus.
+                # Only this joint: the rest of the arm keeps holding.
+                if temps[hot] >= TEMP_CUT and torque[hot]:
+                    arm.torque(hot, False)
+                    torque[hot] = False
+                    status = (f"{hot} at {temps[hot]}C — torque cut on that joint to let "
+                              "it cool. Support the arm.")
 
             if tick % LOAD_EVERY == 0:
                 for n in names:
@@ -392,14 +459,27 @@ def main() -> None:
         if rec is not None:
             rec.close()
         pygame.quit()
-        for n in names:
-            arm.torque(n, False)
+        # A successful park is only worth anything if the arm is still held afterwards;
+        # releasing here would drop it straight out of the pose it just reached.
+        parked = park is not None and park.done and park.outcome == ARRIVED
+        if parked and getattr(park, "released", False):
+            parked = False          # already released on purpose; say so honestly below
+            released_on_purpose = True
+        else:
+            released_on_purpose = False
+        if not parked:
+            for n in names:
+                arm.torque(n, False)
         try:
             if arm.robot is not None:
                 arm.robot.disconnect()
         except Exception:
             pass
-        if names:
+        if released_on_purpose:
+            print("parked and released — the arm is resting, motors cool")
+        elif parked:
+            print("parked — torque left on, the arm is holding its safe pose")
+        elif names:
             print("torque released — support the arm before it drops")
 
 

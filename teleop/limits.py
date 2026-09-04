@@ -31,6 +31,13 @@ POSITION_P = 36
 # and leaving the motor straining at a goal tens of degrees away.
 MAX_LAG = 8.0
 
+# The motors take themselves off the bus at 70C. Cutting torque here keeps a joint below
+# the manufacturer's protection instead of at it — shoulder_lift reached 68C during a
+# gain sweep and had to shut down to survive, while the panel displayed the climb and
+# did nothing about it.
+TEMP_WARN = 45
+TEMP_CUT = 58
+
 LOAD_EVERY = 3
 TEMP_EVERY = 30      # temperature and voltage move slowly; once a second is plenty
 STALE_AFTER = 2.0    # seconds without a good read before a joint is shown unresponsive

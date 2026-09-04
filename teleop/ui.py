@@ -9,6 +9,7 @@ import pygame
 
 from teleop.arm import Arm
 from teleop.calibration_wizard import CENTRE, DONE
+from teleop.park import ARRIVED, ORDER, unreachable
 from teleop.limits import (
     DESC,
     ENCODER,
@@ -89,7 +90,11 @@ class UI:
         lo, hi = SCALE[name]
         clo, chi = TRAVEL[name]
         unit = "%" if name == "gripper" else "\u00b0"
-        outside = pos < clo or pos > chi
+        # Judged against the calibrated range, not against TRAVEL. TRAVEL keeps MARGIN in
+        # hand so commands never push into the stop; a joint that gravity settled a
+        # degree past it is still somewhere the arm reaches on its own, and calling that
+        # "outside travel" contradicts the bar drawn right beside it.
+        outside = pos < lo or pos > hi
 
         rect = pygame.Rect(PAD, y, W - PAD * 2, ROW_H)
         pygame.draw.rect(self.screen, PANEL_SEL if selected else PANEL, rect, border_radius=10)
@@ -374,7 +379,7 @@ def draw_panel(ui, arm, names, pos, target, loads, temps, volts, torque, errors,
     ui.text("direct joint control", ui.f_sub, FAINT, PAD + 218, 27)
 
     stuck_out = [n for n in names
-                 if not (TRAVEL[n][0] <= pos[n] <= TRAVEL[n][1])]
+                 if not (SCALE[n][0] <= pos[n] <= SCALE[n][1])]
     if stuck_out:
         # A joint past its calibrated limit has no travel left in that direction:
         # it will not move however hard it is driven, and every further command
@@ -456,4 +461,110 @@ def draw_panel(ui, arm, names, pos, target, loads, temps, volts, torque, errors,
     ui.text(status, ui.f_small, WARN if stopped else DIM, PAD, fy + 44)
     ui.text(f"calibration ok    {arm.port}", ui.f_small, GOOD, W - PAD, fy + 44,
             right=True)
+    pygame.display.flip()
+
+
+def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
+    """The parking run: which joint is moving now, and what happened to the rest."""
+    s = ui.screen
+    s.fill(BG)
+    pygame.draw.line(s, STROKE, (PAD, 62), (W - PAD, 62), 1)
+    ui.text("Parking", ui.f_title, TEXT, PAD, 20)
+    ui.text("one joint at a time, wrist to base", ui.f_sub, FAINT, PAD + 108, 27)
+
+    card = pygame.Rect(PAD, 104, W - PAD * 2, 340 if park and park.done else 300)
+    pygame.draw.rect(s, PANEL, card, border_radius=12)
+    pygame.draw.rect(s, STROKE, card, 1, border_radius=12)
+    x, y = PAD + 30, 132
+
+    if park is None:
+        if not pose:
+            ui.text("No safe pose saved yet", ui.f_head, WARN, x, y)
+            ui.text("Move the arm where it should rest — by hand with F, or with the",
+                    ui.f_small, DIM, x, y + 34)
+            ui.text("arrow keys — then save that pose here.", ui.f_small, DIM, x, y + 52)
+            bx = ui.keycap("S", x, y + 84, active=True)
+            ui.text("save the current pose as the safe one", ui.f_small, TEXT, bx + 4, y + 87)
+        else:
+            bad = unreachable(pose)
+            if bad:
+                ui.text("This pose is outside the calibrated travel", ui.f_head, BAD, x, y)
+                ui.text("A park to here could never finish: every command is clamped to",
+                        ui.f_small, DIM, x, y + 30)
+                ui.text("the limits, so these joints would stop short every time.",
+                        ui.f_small, DIM, x, y + 48)
+                for i, (j, at, limit) in enumerate(bad):
+                    ui.text(f"{j:16}{at:+8.1f}   needs {limit:+.1f} or inside",
+                            ui.f_val, TEXT, x, y + 80 + i * 22)
+                fy2 = y + 92 + len(bad) * 22
+                ui.text("Move those joints just inside, then save again.",
+                        ui.f_small, WARN, x, fy2)
+                bx = ui.keycap("S", x, fy2 + 26, active=True)
+                ui.text("save the current pose", ui.f_small, TEXT, bx + 4, fy2 + 29)
+                ui.keycap("ESC", PAD, H - 44)
+                ui.text("back to the panel", ui.f_small, FAINT, PAD + 44, H - 41)
+                pygame.display.flip()
+                return
+            ui.text("Park before quitting?" if asked_to_quit else "Park now?",
+                    ui.f_head, TEXT, x, y)
+            ui.text("The arm moves to the saved pose, one joint at a time, wrist first.",
+                    ui.f_small, DIM, x, y + 34)
+            ui.text("It stops on its own if any joint strains or falls short.",
+                    ui.f_small, DIM, x, y + 52)
+            bx = ui.keycap("ENTER", x, y + 84, active=True)
+            ui.text("park" + (", then quit" if asked_to_quit else ""),
+                    ui.f_small, TEXT, bx + 4, y + 87)
+            bx = ui.keycap("S", x + 250, y + 84)
+            ui.text("re-save this pose", ui.f_small, FAINT, bx + 4, y + 87)
+            if asked_to_quit:
+                bx = ui.keycap("Q", x + 480, y + 84)
+                ui.text("quit now — torque off, the arm drops", ui.f_small, BAD,
+                        bx + 4, y + 87)
+        ui.keycap("ESC", PAD, H - 44)
+        ui.text("back to the panel", ui.f_small, FAINT, PAD + 44, H - 41)
+        pygame.display.flip()
+        return
+
+    seen = {j: r for j, r in park.results}
+    for i, j in enumerate(park.joints):
+        row = y + i * 26
+        if j in seen:
+            ok = seen[j] == ARRIVED
+            pygame.draw.circle(s, GOOD if ok else BAD, (x + 6, row + 8), 6)
+            ui.text(seen[j], ui.f_small, GOOD if ok else BAD, x + 250, row + 2)
+        elif j == park.joint and not park.done:
+            pygame.draw.circle(s, ACCENT, (x + 6, row + 8), 6)
+            ui.text("moving", ui.f_small, ACCENT, x + 250, row + 2)
+        else:
+            pygame.draw.circle(s, TRACK, (x + 6, row + 8), 6)
+        ui.text(j, ui.f_val, TEXT if j in seen or j == park.joint else FAINT,
+                x + 24, row)
+        ui.text(f"{park.pose[j]:+.1f}", ui.f_small, FAINT, x + 180, row + 2)
+
+    fy = y + len(park.joints) * 26 + 20
+    if park.done:
+        good = park.outcome == ARRIVED
+        ui.text(park.detail, ui.f_head, GOOD if good else BAD, x, fy)
+        if not good:
+            ui.text("The arm is still held where it stopped. Nothing was forced.",
+                    ui.f_small, DIM, x, fy + 28)
+        if good:
+            ui.text("Is the arm resting on something here?", ui.f_small, TEXT, x, fy + 30)
+            ui.text("A pose it rests on needs no motors, and holding one makes heat.",
+                    ui.f_small, DIM, x, fy + 48)
+            bx = ui.keycap("F", x, fy + 74, active=True)
+            ui.text("release torque and quit", ui.f_small, TEXT, bx + 4, fy + 77)
+            bx = ui.keycap("ENTER", x + 250, fy + 74)
+            ui.text("keep holding and quit", ui.f_small, FAINT, bx + 4, fy + 77)
+        else:
+            bx = ui.keycap("ENTER", x, fy + 74, active=True)
+            ui.text("quit — the arm stays where it stopped", ui.f_small, TEXT,
+                    bx + 4, fy + 77)
+        bx = ui.keycap("ESC", x, fy + 104)
+        ui.text("back to the panel — the arm stays parked", ui.f_small, FAINT,
+                bx + 4, fy + 107)
+    else:
+        ui.text(f"moving {park.joint}", ui.f_head, ACCENT, x, fy)
+        bx = ui.keycap("ESC", x, fy + 34, active=True)
+        ui.text("stop here — the arm stays held", ui.f_small, WARN, bx + 4, fy + 37)
     pygame.display.flip()
