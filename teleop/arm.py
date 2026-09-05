@@ -31,6 +31,7 @@ class Arm:
 
     def __init__(self):
         self.robot = None
+        self.view = None        # a SimView mirroring this arm, when the panel drew one
         self.wizard = None
         self.port = None
         self.names: list[str] = []

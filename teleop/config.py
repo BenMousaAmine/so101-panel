@@ -27,7 +27,8 @@ CALIBRATION = (pathlib.Path.home() / ".cache/huggingface/lerobot/calibration/rob
                / "so_follower" / f"{ROBOT_ID}.json")
 
 # The Feetech bus board enumerates as a usbmodem; other adapters use the FTDI/CP210x name.
-PATTERNS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.SLAB_USBtoUART*")
+PATTERNS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.SLAB_USBtoUART*",
+            "/dev/ttyACM*", "/dev/ttyUSB*")
 
 
 def find_ports() -> list[str]:

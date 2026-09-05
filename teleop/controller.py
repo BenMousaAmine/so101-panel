@@ -1,6 +1,8 @@
 """SO-101 Controller — a graphical panel for driving one joint at a time.
 
-    python teleop/controller.py
+    python teleop/controller.py            the arm, mirrored in 3D beside the panel
+    python teleop/controller.py --sim      no hardware: the model *is* the arm
+    python teleop/controller.py --no-3d    the panel alone, as it was
 
 Direct joint control, no inverse kinematics: nothing can ask a joint for a position it
 cannot reach. Each joint shows its live position against its measured travel, so you
@@ -16,7 +18,13 @@ always see where it is and how much room is left.
     C              guided calibration, one joint at a time
     V              verify the motors against the calibration file, and restore it
     SPACE (hold 1s) release all torque — the arm will drop, so support it first
+    TAB            change the 3D camera — side, front, top
     Q / ESC        quit
+
+The 3D view is a mirror, not a simulation: the real joint positions are written straight
+into the model each frame, so it shows where the arm actually is — including where it
+sagged or was pushed by hand. Under --sim there is no arm and the model is driven by
+physics instead.
 
 On startup the motors are checked against the calibration file: moving the arm by hand
 while unpowered leaves them homed somewhere else, and arming on top of that makes the
@@ -74,6 +82,7 @@ from teleop.ui import (  # noqa: E402
     draw_panel,
     draw_park,
     draw_wizard,
+    widen_for_sim,
 )
 
 
@@ -122,8 +131,32 @@ def sample_climate(arm, joint, temps, volts, errors) -> None:
 
 
 def main() -> None:
+    # The 3D column is standard now: --sim drives the model instead of the arm, and the
+    # real arm gets the same picture mirrored from its own joints. --no-3d opts out.
+    sim = "--sim" in sys.argv
+    show_3d = "--no-3d" not in sys.argv
+    # mujoco is optional: an arm you can drive matters more than a picture of it, so a
+    # missing model costs the 3D column and nothing else. Settled before the window is
+    # built, because the column is width the panel cannot take back afterwards.
+    if show_3d and not sim:
+        try:
+            from teleop.mirror import Mirror
+        except ImportError:
+            show_3d = False
+    if show_3d:
+        widen_for_sim()      # must happen before the window is built
     ui = UI()
-    arm = Arm()
+    mirror = None
+    # --sim flies the whole panel against the MuJoCo model instead of the bus.
+    if sim:
+        from teleop.sim_arm import SimArm      # --sim is nothing without it
+        arm = SimArm(viewer=show_3d)
+    else:
+        arm = Arm()
+        if show_3d:
+            mirror = Mirror()
+            # The panel draws whatever `arm.view` holds; the mirror hands it its own.
+            arm.view = mirror.view if mirror.error is None else None
     names: list[str] = []
     rec = None
 
@@ -159,7 +192,7 @@ def main() -> None:
         loads = dict.fromkeys(names, 0)
         blocked_dir = dict.fromkeys(names, 0)
         sel = 0
-        if rec is None:
+        if rec is None and arm.robot is not None:
             rec = LightRecorder(arm.robot, tag="controller",
                                 extra_fields=["selected", "speed", "moving", "status"])
         status = f"connected on {arm.port}"
@@ -286,6 +319,8 @@ def main() -> None:
                                 status = arm.detail
                     elif not arm.live:
                         pass          # nothing else means anything without an arm
+                    elif ev.key == pygame.K_TAB and getattr(arm, "view", None):
+                        arm.view.cycle_camera()
                     elif pygame.K_1 <= ev.key <= pygame.K_6:
                         sel = ev.key - pygame.K_1
                         status = f"selected {names[sel]}"
@@ -469,6 +504,8 @@ def main() -> None:
                     if f"{n}.pos" in obs:
                         pos[n] = float(obs[f"{n}.pos"])
                         last_ok[n] = time.time()
+            if mirror is not None:
+                mirror.update(obs)
             else:
                 errors["_bus"] = errors.get("_bus", 0) + 1
             if rec is not None:

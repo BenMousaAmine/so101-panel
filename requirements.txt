@@ -1,2 +1,5 @@
 lerobot[feetech]>=0.6.1
 pygame>=2.6
+
+# The 3D view. Without it the panel still runs — pass --no-3d, or let it fall back.
+mujoco>=3.0

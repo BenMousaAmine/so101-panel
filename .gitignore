@@ -1,8 +1,16 @@
 # Which USB port this particular machine found the arm on
 teleop/device.json
 
+# The safe pose is measured on one arm, in that arm's calibration: someone else's is not
+# safe here. Pressing S writes it, so it would otherwise dirty every working tree.
+teleop/safe_pose.json
+
 # Recorded sessions and EEPROM snapshots belong to the arm, not to the tool
 data/
+
+# Editor state, not project state
+.idea/
+.vscode/
 
 .venv/
 __pycache__/

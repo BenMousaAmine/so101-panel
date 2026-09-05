@@ -7,7 +7,7 @@ through a guided procedure instead of a terminal prompt.
 Built on [LeRobot](https://github.com/huggingface/lerobot). No leader arm required —
 the keyboard is the teleoperator.
 
-![The panel driving an SO-101](docs/panel.png)
+![The panel driving an SO-101, with the arm mirrored in 3D](docs/panel.png)
 
 ## Why
 
@@ -31,9 +31,10 @@ port and every script needs the new path. Here it is detected, and remembered.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.12 or newer (required by `lerobot`)
 - An SO-101 follower arm with Feetech STS3215 servos
-- macOS or Linux (the panel is tested on macOS; the serial patterns cover both)
+- macOS or Linux (developed and tested on macOS; the serial patterns cover both)
+- `mujoco` for the 3D view — optional, and installed by `requirements.txt`
 
 ## Install
 
@@ -98,7 +99,9 @@ and, if they disagree, drops torque and writes the file back to the motors.
 | `C` | Guided calibration |
 | `V` | Verify the motors against the calibration file, and restore it if they drifted |
 | `SPACE` (hold 1s) | Release all torque — **the arm will drop** |
-| `Q` / `ESC` | Quit |
+| `P` | Park the arm in its saved safe pose |
+| `TAB` | Change the 3D camera — side, front, top |
+| `Q` / `ESC` | Quit — offers to park first, when a safe pose is saved |
 
 There is no inverse kinematics: a joint can never be asked for a position it cannot
 reach. Each bar is drawn against that joint's calibrated range, filled from its rest
@@ -107,6 +110,38 @@ point, with ticks where the software stops driving.
 The panel refuses to keep straining a stuck joint. Past a load threshold it blocks the
 direction that is straining and tells you to drive the other way — resetting the target
 instead makes the motor fight itself at 30 Hz.
+
+### The 3D view
+
+The column on the right is the arm itself, not an animation of it: the real joint
+positions are written into a MuJoCo model every frame, so it shows where the arm actually
+is — including where it sagged, stalled, or was pushed by hand. `TAB` cycles the camera.
+
+```bash
+python teleop/controller.py --sim      # no hardware at all: the model *is* the arm
+python teleop/controller.py --no-3d    # the panel alone
+```
+
+Under `--sim` the model is driven by physics instead of by the arm, so it falls when
+torque is cut and sags under its own weight — useful for trying a sequence out before
+running it on hardware. It is not a substitute for the real thing: the simulated servos
+saturate at their rated torque, and a parking pose the arm reaches every day can stall
+in simulation.
+
+If `mujoco` is not installed the panel drops the column and runs exactly as before.
+
+### Parking
+
+`P` moves the arm to a pose you saved earlier, and `Q` offers the same thing on the way
+out. Joints go one at a time, wrist to base, so the arm only ever passes through poses
+that order was chosen for — `T` moves them together instead, timed to arrive at once.
+A joint that strains or falls short stops the whole run rather than forcing it.
+
+Press `S` on the parking screen to save wherever the arm is standing now as that pose.
+It is written to `teleop/safe_pose.json`, which is git-ignored: a pose measured on one
+arm, in that arm's calibration, is not a safe pose on another.
+
+![Parking, with the arm mirrored in 3D](docs/parking.png)
 
 ## If a joint will not move
 
@@ -129,6 +164,13 @@ The arm has no brakes. With torque off it falls under its own weight.
 - Quitting releases torque. The arm drops if nothing is holding it.
 - Restoring a calibration changes the position each motor believes it is at, so it is
   always done with torque off.
+- **The panel writes to the motors' EEPROM.** On every connection it sets
+  `P_Coefficient` to 36 on all six joints, and that setting is permanent: it survives
+  closing the panel, and other lerobot scripts will find it. `lerobot`'s own
+  `configure()` writes 16, at which the loop stops pushing long before the available
+  torque is used — measured on this arm, `shoulder_lift` climbed 2.9° at P=16 against
+  36.7° at P=36. To go back to the stock value, run `lerobot`'s setup, or write 16
+  yourself. The constant lives in `teleop/limits.py` as `POSITION_P`.
 
 ## Other tools
 
@@ -154,6 +196,13 @@ SO101_ID=left_arm python teleop/controller.py
 Every session is written to `data/logs/` as CSV, one row per frame with the position,
 load, temperature and voltage of all six joints. Useful for working out what a motor was
 doing before it stalled.
+
+## Credits
+
+The MuJoCo model in `assets/SO101/` comes from the
+[SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100) project, generated from the
+Onshape CAD with [onshape-to-robot](https://github.com/Rhoban/onshape-to-robot). The
+meshes and joint definitions are theirs; only the panel around them is mine.
 
 ## Licence
 

@@ -22,9 +22,20 @@ from teleop.limits import (
     TRAVEL,
 )
 
-PORT_HINT = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*")
+PORT_HINT = ("/dev/cu.usbmodem*", "/dev/ttyACM*")
 
 W, H = 1060, 760
+# --sim adds a column for the model to the right of the panel. W stays the panel's own
+# width so every widget keeps its geometry; only the window knows about the extra space.
+SIM_W = 620
+WINDOW_W = W       # the surface; W stays the panel's own width, so no widget moves
+
+
+def widen_for_sim() -> None:
+    global WINDOW_W
+    WINDOW_W = W + SIM_W
+
+
 PAD = 28
 ROW_H = 78
 ROW_GAP = 6
@@ -50,7 +61,7 @@ def lerp(a, b, t):
 class UI:
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((W, H))
+        self.screen = pygame.display.set_mode((WINDOW_W, H))
         pygame.display.set_caption("SO-101 Controller")
         mono = "menlo,monaco,dejavusansmono,consolas,monospace"
         sans = "helveticaneue,helvetica,arial,sans-serif"
@@ -215,7 +226,7 @@ def draw_wizard(ui, arm) -> None:
         ui.text("save and use it", ui.f_small, TEXT, bx + 4, 399)
         bx = ui.keycap("ESC", bx + 130, 396)
         ui.text("discard", ui.f_small, FAINT, bx + 4, 399)
-        pygame.display.flip()
+        present(ui, arm)
         return
 
     ui.text(w.joint, ui.f_head, TEXT, x, y)
@@ -288,7 +299,7 @@ def draw_wizard(ui, arm) -> None:
 
     ui.keycap("ESC", PAD, H - 44)
     ui.text("cancel — nothing is written", ui.f_small, FAINT, PAD + 44, H - 41)
-    pygame.display.flip()
+    present(ui, arm)
 
 
 def draw_disconnected(ui, arm) -> None:
@@ -364,7 +375,7 @@ def draw_disconnected(ui, arm) -> None:
 
     ui.keycap("Q", PAD, H - 44)
     ui.text("quit", ui.f_small, FAINT, PAD + 30, H - 41)
-    pygame.display.flip()
+    present(ui, arm)
 
 
 def draw_panel(ui, arm, names, pos, target, loads, temps, volts, torque, errors,
@@ -461,7 +472,38 @@ def draw_panel(ui, arm, names, pos, target, loads, temps, volts, torque, errors,
     ui.text(status, ui.f_small, WARN if stopped else DIM, PAD, fy + 44)
     ui.text(f"calibration ok    {arm.port}", ui.f_small, GOOD, W - PAD, fy + 44,
             right=True)
+    present(ui, arm)
+
+
+def present(ui, arm) -> None:
+    """Show the frame, with the simulated arm drawn in first when there is one."""
+    draw_sim_view(ui, arm)
     pygame.display.flip()
+
+
+def draw_sim_view(ui, arm) -> None:
+    """The simulated arm, rendered into the column --sim added. A no-op on real hardware."""
+    view = getattr(arm, "view", None)
+    if view is None:
+        return
+    s = ui.screen
+    x = W + 8
+    panel = pygame.Rect(x, 78, SIM_W - PAD - 8, H - 78 - 96)
+    pygame.draw.rect(s, PANEL, panel, border_radius=10)
+    pygame.draw.rect(s, STROKE, panel, 1, border_radius=10)
+
+    frame = view.frame()
+    if frame is None:
+        ui.text(view.error or "no render", ui.f_small, BAD, panel.x + 16, panel.y + 16)
+        return
+    fw, fh = frame.get_size()
+    scale = min((panel.w - 24) / fw, (panel.h - 52) / fh)
+    if scale < 1.0:
+        frame = pygame.transform.smoothscale(frame, (int(fw * scale), int(fh * scale)))
+    s.blit(frame, frame.get_rect(center=(panel.centerx, panel.centery + 12)))
+    ui.text("SIMULATION", ui.f_small, FAINT, panel.x + 16, panel.y + 14)
+    ui.text(f"{view.camera_name}   TAB", ui.f_small, DIM,
+            panel.right - 16, panel.y + 14, right=True)
 
 
 def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
@@ -503,7 +545,7 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
                 ui.text("save the current pose", ui.f_small, TEXT, bx + 4, fy2 + 29)
                 ui.keycap("ESC", PAD, H - 44)
                 ui.text("back to the panel", ui.f_small, FAINT, PAD + 44, H - 41)
-                pygame.display.flip()
+                present(ui, arm)
                 return
             ui.text("Park before quitting?" if asked_to_quit else "Park now?",
                     ui.f_head, TEXT, x, y)
@@ -525,7 +567,7 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
                         bx + 4, y + 87)
         ui.keycap("ESC", PAD, H - 44)
         ui.text("back to the panel", ui.f_small, FAINT, PAD + 44, H - 41)
-        pygame.display.flip()
+        present(ui, arm)
         return
 
     seen = {j: r for j, r in park.results}
@@ -584,4 +626,4 @@ def draw_park(ui, arm, park, pose: dict, asked_to_quit: bool) -> None:
             by = fy + 34
         bx = ui.keycap("ESC", x, by, active=True)
         ui.text("stop everything — the arm stays held", ui.f_small, WARN, bx + 4, by + 3)
-    pygame.display.flip()
+    present(ui, arm)
